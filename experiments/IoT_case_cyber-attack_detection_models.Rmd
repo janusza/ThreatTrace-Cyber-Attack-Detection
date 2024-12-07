@@ -1,0 +1,507 @@
+---
+title: "Evaluation of the performance cyber-attack detection models for various representations"
+author: "Hidden for the time of the double-blind review process"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+    css: doc.css
+  html_document:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+    css: doc.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(width = 120)  
+
+# installation of the required packages (uncomment the lines below):
+# install.packages(c("data.table", "xgboost", "caTools", "Ckmeans.1d.dp", 
+#                    "ggplot2", "lubridate", "fasttime", "Matrix", "proxy", "glmnet"))
+
+library(data.table)
+library(ggplot2)
+library(lubridate)
+library(fasttime)
+library(caTools)
+
+library(proxy)
+library(xgboost)
+library(glmnet)
+library(skmeans)
+
+library(parallel)
+library(foreach)
+library(doFuture)
+library(progressr)
+
+n_cores <- 8
+
+# local data paths
+data_dir <- "data"
+data_dir_tr <- "data/train_data"
+data_dir_te <- "data/test_data"
+
+# local file names
+training_attacks_file <- "train_files_containing_attacks.txt"
+test_attacks_file <- "test_files_containing_attacks.txt"
+
+# getting lists of files with audit logs
+training_file_list <- dir(file.path(getwd(), data_dir_tr))
+test_file_list <- dir(file.path(getwd(), data_dir_te))
+attack_file_names <- c(readLines(file.path(data_dir, training_attacks_file)),
+                       readLines(file.path(data_dir, test_attacks_file)))
+
+count_unique_traces <- function(traces) {
+  sum(!duplicated(traces))
+}
+
+# an auxiliary function for constructing an XGBoost model
+construct_xgb_from_traces <- function(training_dt, test_dt, n_trees = 1000, params_xgb = list()) {
+
+  # data type conversion
+  validation_set_idx <- sort(sample(nrow(training_dt), round(nrow(training_dt)/20)))
+  xgbMatrix_tr <- xgb.DMatrix(as.matrix(training_dt[-validation_set_idx, !c("time_window_id","is_attack")]), 
+                             label = training_dt[-validation_set_idx, is_attack])
+  xgbMatrix_val <- xgb.DMatrix(as.matrix(training_dt[validation_set_idx, !c("time_window_id","is_attack")]), 
+                             label = training_dt[validation_set_idx, is_attack])
+  xgbMatrix_te <- xgb.DMatrix(as.matrix(test_dt[, !c("time_window_id","is_attack")]), 
+                             label=test_dt[, as.integer(is_attack)])
+  
+  # model construction
+  times <- system.time({
+    xgboostModel <- xgb.train(data = xgbMatrix_tr, 
+                           params = params_xgb, 
+                           nrounds = n_trees, 
+                           print_every_n = round(n_trees/10),
+                           watchlist = list(train = xgbMatrix_tr, 
+                                            validation = xgbMatrix_val, 
+                                            test = xgbMatrix_te))
+  })
+  print(as.numeric(times)[1:3])
+  xgboostModel
+}
+
+construct_glm_from_traces <- function(training_dt, test_dt, params_glm = list()) {
+
+  times <- system.time({
+    glm_model = glmnet::cv.glmnet(as.matrix(training_dt[, !c("time_window_id","is_attack")]), 
+                                  training_dt[, as.integer(is_attack)], 
+                                  family = "binomial", 
+                                  type.measure="auc", 
+                                  nfolds = params_glm$nfolds, 
+                                  weights = params_glm$ws_glmnet,
+                                  alpha = params_glm$alpha, 
+                                  nlambda = params_glm$nlambda)
+  })
+  print(as.numeric(times)[1:3])
+  
+  # test score: 
+  preds_te = predict(glm_model, as.matrix(test_dt[, !c("time_window_id","is_attack")]), 
+                     type="response", s=glm_model$lambda.min)
+  # produce results:
+  list(model = glm_model, te_preds = preds_te)
+}
+
+# computation of trace embedding from token embeddings
+construct_raw_trace_embeddings <- function(traces, token_embeddings, threads = 8) {
+  
+  create_embedding <- function(trace_str, token_embeddings) {
+    
+    trace_vec <- strsplit(trace_str, ",", fixed = TRUE)[[1]]
+    trace_vec <- trace_vec[trace_vec %chin% rownames(token_embeddings)]
+    if(length(trace_vec) > 0) {
+      embedding <- glove_embedding[trace_vec, , drop = FALSE]
+    } else {
+      embedding <- matrix(0, nrow = 1L, ncol = ncol(token_embeddings))
+    }
+    c(nrow(embedding),
+      apply(embedding, 2, mean),
+      apply(embedding, 2, function(x) mean(x^2)),
+      apply(embedding, 2, min),
+      apply(embedding, 2, max))
+  }
+  
+  plan(multisession, workers = threads)
+  
+  embeddings <- foreach(trace_str = traces,
+                        .options.future = list(packages = c("data.table"),
+                                               scheduling = 10.0),
+                        .combine = "rbind") %dofuture% {
+                           
+                          create_embedding(trace_str, token_embeddings)       
+                        }
+  plan(sequential)
+  embeddings
+}
+
+normalize_trace_embeddings <- function(raw_embeddings, action_embedding_size = 8, index_name = "alert_id") {
+  
+  index_ <- raw_embeddings[, get(index_name)]
+  raw_embeddings[, eval(index_name) := NULL]
+  embeddings <- matrix(0, nrow = nrow(raw_embeddings), ncol = 4*action_embedding_size)
+  for(i in 1:action_embedding_size) {
+    embeddings[, i] <- unlist(raw_embeddings[, i+1, with=FALSE])
+    embeddings[, action_embedding_size + i] <- ifelse(unlist(raw_embeddings[, 1,with=FALSE]) > 1, 
+                                                      unlist(sqrt(max(0,unlist(raw_embeddings[, action_embedding_size+i+1,with=FALSE]) - unlist(raw_embeddings[, i+1,with=FALSE])^2)*raw_embeddings[, 1,with=FALSE]/(raw_embeddings[, 1,with=FALSE] - 1))),
+                                                      0)
+    embeddings[, 2*action_embedding_size + i] <- unlist(raw_embeddings[, 2*action_embedding_size+i+1,with=FALSE])
+    embeddings[, 3*action_embedding_size + i] <- unlist(raw_embeddings[, 3*action_embedding_size+i+1,with=FALSE])
+  }
+  
+  data.table(index_col = index_, as.data.table(embeddings))
+}
+
+aggegate_raw_embeddings <- function(raw_embeddings, action_embedding_size = 8) {
+  
+  embeddings <- numeric(ncol(raw_embeddings))
+  embeddings[1] <- sum(raw_embeddings[,1])
+  for(i in 1:action_embedding_size) {
+    embeddings[1+i] <- sum(raw_embeddings[,1,with=FALSE] * raw_embeddings[,1+i,with=FALSE])/embeddings[1]
+    embeddings[1+action_embedding_size+i] <- sum(raw_embeddings[,1,with=FALSE] * raw_embeddings[,1+action_embedding_size+i,with=FALSE])/embeddings[1]
+    embeddings[1+2*action_embedding_size+i] <- min(raw_embeddings[,1+2*action_embedding_size+i,with=FALSE])
+    embeddings[1+3*action_embedding_size+i] <- max(raw_embeddings[,1+3*action_embedding_size+i,with=FALSE])
+  }
+  as.list(embeddings)
+}
+
+# an auxiliary function for compacting traces - merges consecutive actions of the same type
+compact_multi_actions <- function(trace_dt, unique_action_ids, save_progress = TRUE, save_freq = 100) {
+  if(!"compacted_trace" %in% colnames(trace_dt)) trace_dt[, compacted_trace := copy(trace)]
+  
+  counter <- 1
+  for(action in unique_action_ids) {
+    trace_dt[, compacted_trace := gsub(paste0("(,", action, "){2,}"), 
+                                       paste0(",m_", action), 
+                                       compacted_trace)]
+    trace_dt[, compacted_trace := gsub(paste0("^", action, ",m_", action), 
+                                       paste0("m_", action), 
+                                       compacted_trace)]
+    trace_dt[, compacted_trace := gsub(paste0("^", action, ",", action), 
+                                       paste0("m_", action), 
+                                       compacted_trace)]
+    if(save_progress && counter %% save_freq == 0) {
+      save(trace_dt, counter, action, unique_action_ids,
+           file = "tmp_compacted_multi_actions.RData")
+      cat(counter, ":", action, "\n", sep = " ")
+    }
+    counter <- counter + 1
+  }
+  
+  trace_dt[, compacted_trace_length := sapply(strsplit(compacted_trace, ","), length)]
+  if(save_progress) {
+    save(trace_dt, counter, action, unique_action_ids,
+         file = "tmp_compacted_multi_actions.RData")
+  }
+  trace_dt
+}
+
+# an auxiliary function for compacting traces - merges frequent pairs of actions
+compact_action_pairs <- function(trace_dt, sequences, save_progress = TRUE, save_freq = 100) {
+  if(!"compacted_trace" %in% colnames(trace_dt)) trace_dt[, compacted_trace := copy(trace)]
+  
+  sequenceNames <- sequences$seq_name
+  sequences <- gsub("[<{}>]", "", sequences$sequence)
+
+  counter <- 1
+  for(seq_str in sequences) {
+    trace_dt[, compacted_trace := gsub(seq_str,
+                                       sequenceNames[counter], 
+                                       compacted_trace)]
+    if(save_progress && counter %% save_freq == 0) {
+      save(trace_dt, counter, action, unique_action_ids,
+           file = "tmp_compacted_action_pairs.RData")
+      cat(counter, ":", action, "\n", sep = " ")
+    }
+    counter <- counter + 1
+  }
+  
+  trace_dt[, compacted_trace_length := sapply(strsplit(compacted_trace, ","), length)]
+  if(save_progress) {
+    save(trace_dt, counter, seq_str, sequences,
+         file = "tmp_compacted_action_pairs.RData")
+  }
+  trace_dt
+}
+```
+
+### The plan:
+
+1. Loading all data.
+2. Constructing ML-friendly representations of time windows from the model training and evaluation parts of data.
+3. Conducting the initial experiments with ML models for predicting cyber attacks.  
+
+
+```{r processed_data_loading, results='hide'}
+load(file = "process_data_v2.RData")
+
+process_discovery_data[SYSCALL_success == "", SYSCALL_success := "NA"]
+model_training_data[SYSCALL_success == "", SYSCALL_success := "NA"]
+test_data[SYSCALL_success == "", SYSCALL_success := "NA"]
+
+setkey(process_discovery_data, time_window_id, SYSCALL_timestamp)
+setkey(model_training_data, time_window_id, SYSCALL_timestamp)
+setkey(test_data, time_window_id, SYSCALL_timestamp)
+```
+
+This part is responsible for re-creating the baseline representations used in the original competition.
+
+```{r ml_representation_save, warning=FALSE}
+# merging competition data
+joint_data <- rbind(process_discovery_data, model_training_data, test_data, fill = TRUE)
+
+all_target_values <- joint_data[, .(is_attack = as.integer(mean(is_attack))), keyby = time_window_id]
+dt <- joint_data[, .(number_of_events = .N,
+                     number_of_pids = uniqueN(SYSCALL_pid),
+                     max_pid_size = max(table(SYSCALL_pid)),
+                     number_of_timestamps = uniqueN(SYSCALL_timestamp),
+                     number_of_uids = uniqueN(PROCESS_uid),
+                     most_common_uid = first(names(sort(-table(PROCESS_uid)))),
+                     number_of_syscalls = uniqueN(SYSCALL_syscall),
+                     most_common_syscall = first(names(sort(-table(SYSCALL_syscall)))),
+                     percent_of_successes = mean(SYSCALL_success == "yes")),
+                 keyby = time_window_id]
+
+if(any(is.na(dt))) dt[is.na(dt)] <- -1
+dt[, most_common_uid := factor(most_common_uid)]
+dt[, most_common_syscall := factor(most_common_syscall)]
+dt <- mltools::one_hot(dt, cols = c("most_common_uid", "most_common_syscall"), dropCols = TRUE)
+
+# save the first baseline rep
+save(dt, all_target_values, 
+     file = "IoT_case_first_baseline_rep_v1.RData")
+```
+
+```{r process_trace_metadata}
+load(file = "IoT_case_traces_compacted_v1.RData")
+load("IoT_case_glove_embedding_supervised_embedds_v2.RData")
+
+test_process_traces <- test_data[, .(trace_length = .N,
+                                     trace = paste(paste(PROCESS_uid, SYSCALL_syscall, SYSCALL_success, sep = "_"), 
+                                                   collapse = ",")),
+                                     keyby = "time_window_id,SYSCALL_pid"]
+
+test_process_traces <- compact_multi_actions(test_process_traces, unique_actions, 
+                                             save_progress = TRUE, save_freq = 20)
+
+test_process_traces[, trace := NULL]
+test_process_traces[, compacted_trace := paste0("START,", compacted_trace)]
+test_process_traces <- compact_action_pairs(test_process_traces, sequences[size == 2], 
+                                            save_progress = FALSE)
+
+test_process_traces <- compact_multi_actions(test_process_traces, sequences[size == 2, seq_name], 
+                                             save_progress = FALSE)
+
+
+process_traces[, is_attack := NULL]
+process_traces_all <- rbind(process_traces, test_process_traces)
+
+# adding embedding info
+process_traces_all[, compacted_trace_length := compacted_trace_length - 1]
+
+# constructing trace embeddings using token embeddings
+system.time({
+  trace_embeddings <- construct_raw_trace_embeddings(process_traces_all[, compacted_trace], 
+                                                     glove_embedding, threads = n_cores)
+})
+
+# combining data
+process_traces_all[, compacted_trace := NULL]
+process_traces_all <- cbind(process_traces_all, trace_embeddings)
+save(process_traces_all, file = "IoT_case_all_trace_glove_embeddings_supervised_embedds_v3.RData")
+rm(trace_embeddings)
+
+# adding trace metadata...
+process_metadata <- process_traces_all[, {.(n_of_traces = .N,
+                                            min_compacted_length = min(compacted_trace_length),
+                                            mean_compacted_length = mean(compacted_trace_length),
+                                            max_compacted_length = max(compacted_trace_length),
+                                            min_length = min(trace_length),
+                                            mean_length = mean(trace_length),
+                                            max_length = max(trace_length),
+                                            tot_variant_length = sum(trace_length),
+                                            tot_compacted_variant_length = sum(compacted_trace_length))},
+                                      keyby = time_window_id]
+
+# and aggregating the embeddings
+process_embeddings <- process_traces_all[, aggegate_raw_embeddings(.SD, action_embedding_size = ncol(glove_embedding)),
+                                         .SDcols = 5:ncol(process_traces_all),
+                                         keyby = time_window_id]
+
+process_embeddings_norm <- normalize_trace_embeddings(copy(process_embeddings), 
+                                                      action_embedding_size = ncol(glove_embedding),
+                                                      index_name = "time_window_id")
+
+save(process_metadata, process_embeddings, process_embeddings_norm,
+     file = "IoT_case_all_trace_glove_embeddings_processed_supervised_embedds_v3.RData")
+```
+
+```{r embedding_clusters}
+alerts_to_filter <- process_embeddings_norm[which(apply(as.matrix(process_embeddings_norm[, !"index_col"]), 1, function(x) all(x == 0))), index_col]
+
+n_clusters <- 25
+skmeans_clusters <- e1071::cmeans(scale(as.matrix(process_embeddings_norm[!(index_col %in% alerts_to_filter), !"index_col"])), 
+                                  centers = n_clusters, m = 2)
+table(skmeans_clusters$cluster) # looks promising 
+head(skmeans_clusters$membership)
+
+process_clusters <- data.table(index_col = c(alerts_to_filter, process_embeddings_norm[!(index_col %in% alerts_to_filter), index_col]),
+                               as.data.table(rbind(matrix(-1, nrow = length(alerts_to_filter), ncol = n_clusters), skmeans_clusters$membership)))
+setnames(process_clusters, c("index_col", paste0("process_cluster_", 1:n_clusters)))
+
+tmp_targets <- merge(all_target_values, process_clusters, 
+                     by.x = "time_window_id", by.y = "index_col", all.y = TRUE)
+cluster_ids <- apply(tmp_targets[, !c("time_window_id","is_attack")], 1, which.max)
+sum(apply(table(cluster_ids, tmp_targets[, is_attack]), 1, function(x) -sum((x/sum(x))*log(x/sum(x)))*sum(x)), na.rm=TRUE)/nrow(tmp_targets)
+
+save(process_clusters, skmeans_clusters, 
+     file = "IoT_case_process_clusters_processed_supervised_embedds_v3.RData") 
+```
+
+
+```{r hyperparams}
+tr_data_labels <- all_target_values[!(time_window_id %chin% test_data[, time_window_id])]
+prior_probs <- tr_data_labels[, .(prob = .N/nrow(tr_data_labels)), keyby = is_attack]
+
+te_data_labels <- all_target_values[time_window_id %chin% test_data[, time_window_id]]
+
+# hyperparameters for XGBoost:
+n_trees <- 2000
+params_xgb <- list(booster = "gbtree",
+                   device = "gpu",
+                  objective = "binary:logistic",
+                  eta = 0.025, 
+                  max_depth = 10, 
+                  lambda = 5.0, alpha = 20.0, 
+                  subsample = 0.95, colsample_bytree = 0.8,
+                  base_score = prior_probs[is_attack == 1, prob],
+                  nthread = n_cores)
+
+# hyperparameters for GLMnet:
+params_glm = list(alpha = 1, nfolds = 10, nlambda = 200, 
+                  ws_glmnet = prior_probs[tr_data_labels, on = "is_attack"][, 1/prob])
+```
+
+### Evaluation of the XGBoost baseline model
+
+```{r xgb_baseline, warning=FALSE, fig.hold='hold', out.width="100%", fig.width=12}
+load(file = "IoT_case_first_baseline_rep_v1.RData")
+training_dt <- dt[time_window_id %chin% tr_data_labels[, time_window_id]]
+test_dt <- dt[time_window_id %chin% te_data_labels[, time_window_id]]
+
+training_dt <- merge(training_dt, tr_data_labels, by = "time_window_id")
+test_dt <- merge(test_dt, te_data_labels, by = "time_window_id")
+
+# building an XGBoost model for the representation by all compacted variants from the training data
+xgboostModel <- construct_xgb_from_traces(training_dt, test_dt,
+                                          n_trees = n_trees, 
+                                          params_xgb = params_xgb)
+
+# test score: 
+preds <- predict(xgboostModel, as.matrix(test_dt[, !c("time_window_id","is_attack")]))
+print(colAUC(preds, test_dt[, is_attack]))
+
+# confusion matrix
+table(preds > training_dt[, mean(is_attack)], test_dt[, is_attack] > 0)
+
+# estimation of the feature importance
+importance_matrix <- xgb.importance(colnames(training_dt[, !c("time_window_id","is_attack")]), 
+                                    model = xgboostModel)
+feat_importance_plot = xgb.ggplot.importance(importance_matrix, 
+                                            measure = "Gain", 
+                                            rel_to_first = TRUE, 
+                                            top_n = 20)
+feat_importance_plot + ylab("Gain")
+
+importance_matrix
+```
+
+### Effect of trace data on basaeline 1
+
+```{r xgb_baseline_extended, warning=FALSE, fig.hold='hold', out.width="100%", fig.width=12}
+load(file = "IoT_case_first_baseline_rep_v1.RData")
+dt <- merge(dt, process_metadata, by.x = "time_window_id", by.y = "time_window_id", all.y = TRUE)
+dt <- merge(dt, process_embeddings_norm, by.x = "time_window_id", by.y = "index_col", all.y = TRUE)
+dt <- merge(dt, process_clusters, by.x = "time_window_id", by.y = "index_col", all.y = TRUE)
+training_dt <- dt[time_window_id %chin% tr_data_labels[, time_window_id]]
+test_dt <- dt[time_window_id %chin% te_data_labels[, time_window_id]]
+
+training_dt <- merge(training_dt, tr_data_labels, by = "time_window_id")
+test_dt <- merge(test_dt, te_data_labels, by = "time_window_id")
+
+# building an XGBoost model for the representation by all compacted variants from the training data
+xgboostModel <- construct_xgb_from_traces(training_dt, test_dt,
+                                          n_trees = n_trees, 
+                                          params_xgb = params_xgb)
+
+# test score: 
+preds <- predict(xgboostModel, as.matrix(test_dt[, !c("time_window_id","is_attack")]))
+print(colAUC(preds, test_dt[, is_attack]))
+
+# confusion matrix
+table(preds > training_dt[, mean(is_attack)], test_dt[, is_attack] > 0)
+
+# estimation of the feature importance
+importance_matrix <- xgb.importance(colnames(training_dt[, !c("time_window_id","is_attack")]), 
+                                    model = xgboostModel)
+feat_importance_plot = xgb.ggplot.importance(importance_matrix, 
+                                            measure = "Gain", 
+                                            rel_to_first = TRUE, 
+                                            top_n = 20)
+feat_importance_plot + ylab("Gain")
+
+importance_matrix
+```
+
+### Evaluation of the GLMNet baseline model
+
+```{r glm_baseline1_extended, warning=FALSE, fig.hold='hold', out.width="100%", fig.width=12}
+load(file = "IoT_case_first_baseline_rep_v1.RData")
+training_dt <- dt[time_window_id %chin% tr_data_labels[, time_window_id]]
+test_dt <- dt[time_window_id %chin% te_data_labels[, time_window_id]]
+
+training_dt <- merge(training_dt, tr_data_labels, by = "time_window_id")
+test_dt <- merge(test_dt, te_data_labels, by = "time_window_id")
+
+# building an XGBoost model for the representation by all compacted variants from the training data
+glmnetModel <- construct_glm_from_traces(training_dt, test_dt,
+                                          params_glm = params_glm)
+
+# test score: 
+preds <- glmnetModel$te_preds
+print(colAUC(preds, test_dt[, is_attack]))
+
+# confusion matrix
+table(preds > training_dt[, mean(is_attack)], test_dt[, is_attack] > 0)
+```
+
+### Effect of trace data on basaeline 2
+
+```{r glm_baseline2_extended, warning=FALSE, fig.hold='hold', out.width="100%", fig.width=12}
+load(file = "IoT_case_first_baseline_rep_v1.RData")
+dt <- merge(dt, process_metadata, by.x = "time_window_id", by.y = "time_window_id", all.y = TRUE)
+dt <- merge(dt, process_embeddings_norm, by.x = "time_window_id", by.y = "index_col", all.y = TRUE)
+dt <- merge(dt, process_clusters, by.x = "time_window_id", by.y = "index_col", all.y = TRUE)
+training_dt <- dt[time_window_id %chin% tr_data_labels[, time_window_id]]
+test_dt <- dt[time_window_id %chin% te_data_labels[, time_window_id]]
+
+training_dt <- merge(training_dt, tr_data_labels, by = "time_window_id")
+test_dt <- merge(test_dt, te_data_labels, by = "time_window_id")
+
+# building an XGBoost model for the representation by all compacted variants from the training data
+glmnetModel <- construct_glm_from_traces(training_dt, test_dt,
+                                          params_glm = params_glm)
+
+# test score: 
+preds <- glmnetModel$te_preds
+print(colAUC(preds, test_dt[, is_attack]))
+
+# confusion matrix
+table(preds > training_dt[, mean(is_attack)], test_dt[, is_attack] > 0)
+```
+

@@ -1,0 +1,534 @@
+---
+title: "Cybersecurity Threat Detection in the Behavior of IoT Devices"
+author: "Hidden for the time of the double-blind review process"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+    css: doc.css
+  html_document:
+    df_print: paged
+    fig_height: 10
+    fig_width: 10
+    rows.print: 10
+    css: doc.css
+---
+
+### The plan:
+
+1. Loading all data.
+2. Extracting statistics regarding PIDs (cases) and syscall types (actions).
+3. Computation of basic aggregations and visualization of the results.  
+
+The original source system audit logs are the property of KnowledgePit.ai platform and can be downloaded from:
+https://knowledgepit.ai/fedcsis-2023-challenge/
+
+```{r setup, include=FALSE, results=FALSE} 
+options(width = 120)
+
+# installation of the required packages (uncomment the lines below):
+# install.packages(c("data.table", "arules", "arulesSequences", "arulesViz", 
+#                    "ggplot2", "lubridate", "fasttime", "Matrix"))
+
+library(data.table)
+library(Matrix)
+library(arules)
+library(arulesSequences)
+library(arulesViz)
+library(ggplot2)
+library(lubridate)
+library(fasttime)
+
+library(bupaverse)
+library(text2vec)
+library(uwot)
+
+library(parallel)
+library(foreach)
+library(doFuture)
+library(progressr)
+
+n_cores <- 8
+
+# local data paths
+data_dir <- "data"
+data_dir_tr <- "data/train_data"
+data_dir_te <- "data/test_data"
+
+# local file names
+training_attacks_file <- "train_files_containing_attacks.txt"
+test_attacks_file <- "test_files_containing_attacks.txt"
+
+# getting lists of files with audit logs
+training_file_list <- dir(file.path(getwd(), data_dir_tr))
+test_file_list <- dir(file.path(getwd(), data_dir_te))
+attack_file_names <- c(readLines(file.path(data_dir, training_attacks_file)),
+                       readLines(file.path(data_dir, test_attacks_file)))
+
+# custom function definitions
+extract_basic_info <- function(logs) {
+  n_of_pids <- logs[, uniqueN(SYSCALL_pid)]
+  n_of_unique_actions <- logs[, uniqueN(SYSCALL_syscall)]
+  n_of_events <- nrow(logs)
+  avg_actions_per_pid <- n_of_events/n_of_pids
+  actions_per_pid_quants <- logs[, .N, SYSCALL_pid][, quantile(N, c(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0))]
+  
+  list(n_of_pids = n_of_pids,
+       n_of_unique_actions = n_of_unique_actions,
+       n_of_events = n_of_events,
+       avg_actions_per_pid = avg_actions_per_pid,
+       actions_per_pid_quants = actions_per_pid_quants
+  )
+}
+
+getSequenceID <- function(itemsetIDs) {
+  sapply(strsplit(itemsetIDs, "_"), function(x) paste0(x[1], "_", x[2]))
+}
+
+getTimestamp <- function(itemsetIDs) {
+  sapply(strsplit(itemsetIDs, "_"), function(x) as.integer(x[3]))
+}
+
+# an auxiliary function for compacting traces - merges consecutive actions of the same type
+compact_multi_actions <- function(trace_dt, unique_action_ids, save_progress = TRUE, save_freq = 100) {
+  if(!"compacted_trace" %in% colnames(trace_dt)) trace_dt[, compacted_trace := copy(trace)]
+  
+  counter <- 1
+  for(action in unique_action_ids) {
+    trace_dt[, compacted_trace := gsub(paste0("(,", action, "){2,}"), 
+                                       paste0(",m_", action), 
+                                       compacted_trace)]
+    trace_dt[, compacted_trace := gsub(paste0("^", action, ",m_", action), 
+                                       paste0("m_", action), 
+                                       compacted_trace)]
+    trace_dt[, compacted_trace := gsub(paste0("^", action, ",", action), 
+                                       paste0("m_", action), 
+                                       compacted_trace)]
+    if(save_progress && counter %% save_freq == 0) {
+      save(trace_dt, counter, action, unique_action_ids,
+           file = "tmp_compacted_multi_actions.RData")
+      cat(counter, ":", action, "\n", sep = " ")
+    }
+    counter <- counter + 1
+  }
+  
+  trace_dt[, compacted_trace_length := sapply(strsplit(compacted_trace, ","), length)]
+  if(save_progress) {
+    save(trace_dt, counter, action, unique_action_ids,
+         file = "tmp_compacted_multi_actions.RData")
+  }
+  trace_dt
+}
+
+# an auxiliary function for compacting traces - merges frequent pairs of actions
+compact_action_pairs <- function(trace_dt, sequences, save_progress = TRUE, save_freq = 100) {
+  if(!"compacted_trace" %in% colnames(trace_dt)) trace_dt[, compacted_trace := copy(trace)]
+  
+  sequenceNames <- sequences$seq_name
+  sequences <- gsub("[<{}>]", "", sequences$sequence)
+
+  counter <- 1
+  for(seq_str in sequences) {
+    trace_dt[, compacted_trace := gsub(seq_str,
+                                       sequenceNames[counter], 
+                                       compacted_trace)]
+    if(save_progress && counter %% save_freq == 0) {
+      save(trace_dt, counter, action, unique_action_ids,
+           file = "tmp_compacted_action_pairs.RData")
+      cat(counter, ":", action, "\n", sep = " ")
+    }
+    counter <- counter + 1
+  }
+  
+  trace_dt[, compacted_trace_length := sapply(strsplit(compacted_trace, ","), length)]
+  if(save_progress) {
+    save(trace_dt, counter, seq_str, sequences,
+         file = "tmp_compacted_action_pairs.RData")
+  }
+  trace_dt
+}
+
+# auxiliary function for efficient counting possibly long unique traces
+count_unique_traces <- function(traces) {
+  sum(!duplicated(traces))
+}
+
+# custom implementation of the apriori algorithm for event sequences
+sequence_apriori <- function(process_traces, trace_lengths,
+                             min_case_support = 0.01, 
+                             min_tot_support = 0.01, 
+                             unique_actions = NULL,
+                             max_seq_length = 2,
+                             threads = 10) {
+  
+  # custom computation of sequences' supports
+  compute_supports <- function(candidates, process_traces) {
+
+    #progress_bar <- progressr::progressor(along = process_traces)
+    candidate_sequences <- foreach(trace = process_traces,
+                                    .options.future = list(packages = c("stringr"),
+                                                           chunk.size = structure(200, ordering = "random")),
+                                    .combine = "combine_counts") %dofuture% {
+      counts <- sapply(stringr::str_extract_all(trace, stringr::fixed(paste0(",", candidates))), length)
+      #progress_bar(message = sprintf("Processing ..."))
+      list(case_supp = as.integer(counts > 0L),
+           tot_supp = counts)
+    }
+    candidate_sequences
+  }
+  
+  # auxiliary function for combining sequence counts
+  combine_counts <- function(cnts1, cnts2) {
+    
+    list(case_supp = cnts1$case_supp + cnts2$case_supp,
+         tot_supp = cnts1$tot_supp + cnts2$tot_supp)
+  }
+  
+  # filtering function for selecting frequent sequences
+  check_thresholds <- function(candidate_counts, candidate_names, n_traces, n_sequences,
+                               min_case_support = 0.01,
+                               min_tot_support = 0.01) {
+    
+    freq_sequences <- candidate_counts$case_supp >= min_case_support*n_traces | 
+                        candidate_counts$tot_supp >= min_tot_support*n_sequences
+    data.table(sequence = candidate_names[freq_sequences],
+               case_support = candidate_counts$case_supp[freq_sequences]/n_traces,
+               tot_support = candidate_counts$tot_supp[freq_sequences]/n_sequences)
+  }
+  
+  # constructing candidate sequences of size = seq_size + 1
+  construct_candidates <- function(freq_seq, seq_size) {
+    
+    freq_sequences <- strsplit(freq_seq[, sequence], ",", fixed = TRUE)
+    prefixes <- sapply(freq_sequences, function(x) paste(first(x, max(0, seq_size - 1)), collapse = ","))
+    surfixes <- sapply(freq_sequences, function(x) paste(last(x, max(0, seq_size - 1)), collapse = ","))
+    
+    candidates <- foreach(id = 1:length(freq_sequences),
+                          .options.future = list(packages = c("data.table"),
+                                                 scheduling = 1.0),
+                          .combine = "c") %dofuture% {
+      surfix_matches <- prefixes == surfixes[id]
+      surfix_matches[id] <- FALSE
+      if(any(surfix_matches)) { 
+        tmp <- paste0(freq_seq[id, sequence], ",", sapply(freq_sequences[surfix_matches], last))
+      } else tmp <- NULL
+      tmp
+    }
+    candidates
+  }
+  
+  if(max_seq_length < 1) stop("wrong max_seq_length value")
+  if(min_case_support <= 0 || min_tot_support <= 0) stop("wrong support value")
+  if(!is.character(process_traces) || length(process_traces) <= 0) stop("process_traces should be a character vector")
+  if(length(process_traces) != length(trace_lengths)) stop("process_traces and trace_lengths should have the same length")
+  
+  if(is.null(unique_actions)) {
+    unique_actions <- unique(unlist(lapply(strsplit(process_traces, ",", fixed = TRUE), unique)))
+    unique_actions <- unique_actions[unique_actions != ""]
+  }
+  
+  #process_traces <- paste0(",", process_traces)
+  
+  freq_sequences <- list()
+  candidate_sequences <- sort(unique_actions)
+
+  plan(multisession, workers = threads)
+  #handlers(global = TRUE)
+  #handlers("progress")
+  
+  for(seq_length in 1:max_seq_length) {
+    cat("processing sequences length ", seq_length, ":\n", sep = "")
+    
+    candidate_seq_counts <- compute_supports(candidate_sequences, process_traces)
+    
+    freq_sequences[[seq_length]] <- check_thresholds(candidate_seq_counts, candidate_sequences,
+                                                     sum(trace_lengths >= seq_length), sum(pmax(trace_lengths - (seq_length - 1L), 0L)),
+                                                     min_case_support, min_tot_support)
+    
+    if(seq_length < max_seq_length) candidate_sequences <- construct_candidates(freq_sequences[[seq_length]], seq_length)
+  }
+  plan(sequential)
+  data.table::rbindlist(freq_sequences)
+}
+
+# computation of trace embedding from token embeddings
+construct_raw_trace_embeddings <- function(traces, token_embeddings, threads = 8) {
+  
+  create_embedding <- function(trace_str, token_embeddings) {
+    
+    trace_vec <- strsplit(trace_str, ",", fixed = TRUE)[[1]]
+    trace_vec <- trace_vec[trace_vec %chin% rownames(token_embeddings)]
+    if(length(trace_vec) > 0) {
+      embedding <- glove_embedding[trace_vec, , drop = FALSE]
+    } else {
+      embedding <- matrix(0, nrow = 1L, ncol = ncol(token_embeddings))
+    }
+    c(nrow(embedding),
+      apply(embedding, 2, mean),
+      apply(embedding, 2, function(x) mean(x^2)),
+      apply(embedding, 2, min),
+      apply(embedding, 2, max))
+  }
+  
+  plan(multisession, workers = threads)
+  
+  embeddings <- foreach(trace_str = traces,
+                        .options.future = list(packages = c("data.table"),
+                                               scheduling = 10.0),
+                        .combine = "rbind") %dofuture% {
+                           
+                          create_embedding(trace_str, token_embeddings)       
+                        }
+  plan(sequential)
+  embeddings
+}
+
+normalize_trace_embeddings <- function(raw_embeddings, action_embedding_size = 8) {
+  
+  if("alert_id" %in% colnames(raw_embeddings)) {
+    alert_id <- raw_embeddings[, alert_id]
+    raw_embeddings[, alert_id := NULL]
+  } else {
+    alert_id <- 1:nrow(raw_embeddings)
+  }
+  
+  embeddings <- matrix(0, nrow = nrow(raw_embeddings), ncol = 4*action_embedding_size)
+  for(i in 1:action_embedding_size) {
+    embeddings[, i] <- unlist(raw_embeddings[, i+1, with=FALSE])
+    embeddings[, action_embedding_size + i] <- ifelse(unlist(raw_embeddings[, 1,with=FALSE]) > 1, 
+                                                      unlist(sqrt(max(0,unlist(raw_embeddings[, action_embedding_size+i+1,with=FALSE]) - unlist(raw_embeddings[, i+1,with=FALSE])^2)*raw_embeddings[, 1,with=FALSE]/(raw_embeddings[, 1,with=FALSE] - 1))),
+                                                      0)
+    embeddings[, 2*action_embedding_size + i] <- unlist(raw_embeddings[, 2*action_embedding_size+i+1,with=FALSE])
+    embeddings[, 3*action_embedding_size + i] <- unlist(raw_embeddings[, 3*action_embedding_size+i+1,with=FALSE])
+  }
+  
+  data.table(alert_id = alert_id, as.data.table(embeddings))
+}
+
+aggegate_raw_embeddings <- function(raw_embeddings, action_embedding_size = 8) {
+  
+  embeddings <- numeric(ncol(raw_embeddings))
+  embeddings[1] <- sum(raw_embeddings[,1])
+  for(i in 1:action_embedding_size) {
+    embeddings[1+i] <- sum(raw_embeddings[,1,with=FALSE] * raw_embeddings[,1+i,with=FALSE])/embeddings[1]
+    embeddings[1+action_embedding_size+i] <- sum(raw_embeddings[,1,with=FALSE] * raw_embeddings[,1+action_embedding_size+i,with=FALSE])/embeddings[1]
+    embeddings[1+2*action_embedding_size+i] <- min(raw_embeddings[,1+2*action_embedding_size+i,with=FALSE])
+    embeddings[1+3*action_embedding_size+i] <- max(raw_embeddings[,1+3*action_embedding_size+i,with=FALSE])
+  }
+  as.list(embeddings)
+}
+
+```
+
+The available data contains `r length(training_file_list) + length(test_file_list)` log files. Each of the files corresponds to 10 minutes of syscall history. In total, `r length(attack_file_names)` log files (`r round(100*length(attack_file_names)/(length(training_file_list) + length(test_file_list)), 2)`\%) correspond to attacks on the devices.
+
+To enable the analysis of this data using process mining techniques, I would suggest to consider the combination of a time window ID ( __time_window_id__ ) and __SYSCALL_pid__ values as _cases_ and combinations of __SYSCALL_syscall__, __SYSCALL_success__, and maybe __PROCESS_uid__ values as _actions_. 
+
+We transform the data by selecting __SYSCALL_timestamp__, __SYSCALL_pid__, __SYSCALL_success__, __PROCESS_uid__, and __SYSCALL_syscall__ columns. We also merge all data tables into a single table for more convenient processing. Finally, I divide the data into three parts:
+  
+  - _process_discovery_ part,   
+  - _model_training_ part,
+  - _test_data_ part.
+
+```{r processed_data_loading, results='hide'}
+load(file = "process_data_v2.RData")
+
+process_discovery_data[SYSCALL_success == "", SYSCALL_success := "NA"]
+model_training_data[SYSCALL_success == "", SYSCALL_success := "NA"]
+test_data[SYSCALL_success == "", SYSCALL_success := "NA"]
+
+setkey(process_discovery_data, time_window_id, SYSCALL_timestamp)
+setkey(model_training_data, time_window_id, SYSCALL_timestamp)
+setkey(test_data, time_window_id, SYSCALL_timestamp)
+```
+
+```{r bupar_experim, warning=FALSE, fig.hold='hold', out.width="100%", fig.width=12}
+eventlog_data <- eventlog(as.data.frame(process_discovery_data),
+                          case_id = c("time_window_id", "SYSCALL_pid"),
+                          timestamp = "SYSCALL_timestamp",
+                          activity_id = c("PROCESS_uid", "SYSCALL_syscall", "SYSCALL_success"),
+                          activity_instance_id = c("time_window_id", "SYSCALL_pid", "PROCESS_uid", 
+                                                   "SYSCALL_syscall", "SYSCALL_success", "SYSCALL_timestamp"),
+                          resource_id = c("PROCESS_uid"),
+                          lifecycle_id = "is_attack",
+                          order = "alphabetical"
+                          )
+
+eventlog_data
+
+trace_data <- traces(eventlog_data)
+trace_data
+
+frequent_traces <- filter_trace_frequency(eventlog_data, percentage = .8)
+frequent_traces
+
+attack_traces <- filter_lifecycle_presence(eventlog_data, lifecycles = "TRUE", method = "all")
+attack_traces
+```
+```{r ploting_variants_1, warning=FALSE, fig.hold='hold', out.width="100%", fig.width=18}
+flow_plot <- process_map(frequent_traces, type = frequency("relative"))
+flow_plot
+
+frequent_attack_traces <- filter_trace_frequency(attack_traces, percentage = .8)
+attacks_flow_plot <- process_map(frequent_attack_traces, type = frequency("relative"))
+attacks_flow_plot
+
+variant_viz <- trace_explorer(eventlog_data, coverage = 0.5)
+variant_viz
+```
+
+```{r compacting_traces}
+process_traces <- rbind(process_discovery_data, model_training_data)[, .(trace_length = .N,
+                                                                         trace = paste(first(is_attack), paste(paste(PROCESS_uid, SYSCALL_syscall, SYSCALL_success, sep = "_"), 
+                                                                                       collapse = ","), first(is_attack), sep = ","),
+                                                                         is_attack = unique(is_attack)),
+                                                                     keyby = "time_window_id,SYSCALL_pid"]
+
+unique_action_ids <- process_traces[, unique(unlist(lapply(strsplit(trace, ",", fixed = TRUE), unique)))]
+process_traces <- compact_multi_actions(process_traces, unique_action_ids, 
+                                        save_progress = TRUE, save_freq = 20)
+
+process_traces[, trace := NULL]
+rm(eventlog_data, trace_data)
+save(process_traces, file = "IoT_case_process_traces_crucial_cols_supervised_embedds.RData")
+
+traces <- process_traces[, compacted_trace]
+trace_lengths <- process_traces[, compacted_trace_length]
+rm(process_traces)
+
+traces <- paste0(",", traces)
+
+system.time({
+  sequences <- sequence_apriori(traces, trace_lengths,
+                               min_case_support = 0.01, 
+                               min_tot_support = 0.01, 
+                               unique_actions = NULL,
+                               max_seq_length = 2,
+                               threads = 8)
+})
+sequences[, size := sapply(stringr::str_extract_all(sequence, stringr::fixed(",")), length) + 1L]
+sequences <- sequences[order(size, tot_support, decreasing = TRUE), ]
+sequences[, seq_name := paste0("seq_", 1:nrow(sequences))]
+save(sequences, file = "IoT_case_cspade_2sequences_from_pd_plus_tr_sets_supervised_embedds.RData")
+
+sequences <- sequences[-grep("(TRUE)|(FALSE)", sequence)]
+load(file = "IoT_case_process_traces_crucial_cols_supervised_embedds.RData")
+process_traces[, compacted_trace := paste0("START,", compacted_trace)]
+process_traces <- compact_action_pairs(process_traces, sequences[size == 2], 
+                                       save_progress = FALSE)
+
+process_traces <- compact_multi_actions(process_traces, sequences[size == 2, seq_name], 
+                                        save_progress = FALSE)
+unique_actions <- unique(unlist(lapply(strsplit(process_traces[, compacted_trace], ",", fixed = TRUE), unique)))
+save(process_traces, sequences, unique_actions, 
+     file = "IoT_case_traces_compacted_supervised_embedds.RData")
+```
+
+```{r computing_action_embeddings_with_glove, fig.hold='hold', out.width="100%", fig.width=12, fig.height=9}
+load(file = "IoT_case_traces_compacted_supervised_embedds.RData")
+
+token_long_vec <- strsplit(process_traces[, compacted_trace], ",", fixed = TRUE)
+token_long_vec <- lapply(token_long_vec, last, -1)
+token_long_vec <- token_long_vec[sapply(token_long_vec, length) > 1]
+it <- itoken(token_long_vec, 
+             preprocessor = identity,
+             tokenizer = word_tokenizer,
+             ids = 1:length(token_long_vec),
+             progressbar = FALSE)
+process_vocab <- create_vocabulary(it)
+process_vocab <- prune_vocabulary(process_vocab, term_count_min = 5L)
+
+vectorizer = vocab_vectorizer(process_vocab)
+
+process_tcm = create_tcm(it, vectorizer, 
+                         skip_grams_window = 10L,
+                         skip_grams_window_context = "symmetric")
+process_tcm <- process_tcm/100
+
+# maybe Savandi could play with it?
+glove_model <- GloVe$new(rank = 32, x_max = 0.01*nrow(process_traces),
+                         learning_rate = 0.20,                                          # the default was 0.15
+                         alpha = 0.75,                                                  # the default was 0.75
+                         lambda = 0,                                                    # the default was 0
+                         shuffle = TRUE,                                                # the default was FALSE
+                         init = list(w_i = NULL, b_i = NULL, w_j = NULL, b_j = NULL))   # the default 
+
+glove_embedding <- glove_model$fit_transform(process_tcm, n_iter = 100, 
+                                             convergence_tol = -1, n_threads = n_cores)
+
+glove_embedding <- glove_embedding + t(glove_model$components)
+
+glove_umap <- umap(glove_embedding, n_components = 2, metric = "cosine", n_neighbors = 10, min_dist = 0.2)
+df_glove_umap <- as.data.frame(glove_umap, stringsAsFactors = FALSE)
+df_glove_umap$event_type <- rownames(glove_embedding)
+colnames(df_glove_umap) <- c("UMAP1", "UMAP2", "event_type")
+
+fig1 <- ggplot(df_glove_umap) +
+      geom_point(aes(x = UMAP1, y = UMAP2, label = event_type), colour = 'blue', size = 1.0) #+
+fig1
+
+save(glove_embedding, file = "IoT_case_glove_embedding_supervised_embedds_v3.RData")
+```
+
+```{r constructing_trace_embeddings, fig.hold='hold', out.width="100%", fig.width=12, fig.height=9}
+load(file = "IoT_case_traces_compacted_supervised_embedds.RData")
+load(file = "IoT_case_glove_embedding_supervised_embedds_v3.RData")
+process_traces[, compacted_trace_length := compacted_trace_length - 1]
+
+# adding attack probs
+prior_prob <- process_traces[, .(attacks = unique(is_attack)), by = time_window_id][, mean(attacks)]
+
+process_traces[, compacted_trace := gsub("START,FALSE,", "", compacted_trace)]
+process_traces[, compacted_trace := gsub("START,TRUE,", "", compacted_trace)]
+process_traces[, compacted_trace := gsub(",FALSE", "", compacted_trace)]
+process_traces[, compacted_trace := gsub(",TRUE", "", compacted_trace)]
+process_traces[, trace_factor := as.factor(compacted_trace)]
+process_variants <- process_traces[, .(compacted_trace_length = compacted_trace_length[1], 
+                                       trace_length = trace_length[1], 
+                                       support = .N, 
+                                       attack_prob = (sum(is_attack) + prior_prob)/(.N + 1)),
+                                   keyby = trace_factor]
+process_variants[, compacted_trace := as.character(trace_factor)]
+process_variants[, trace_factor := NULL]
+
+# constructing trace embeddings using token embeddings
+system.time({
+  trace_embeddings <- construct_raw_trace_embeddings(process_variants[, compacted_trace], 
+                                                     glove_embedding, threads = n_cores)
+})
+trace_embeddings[is.na(trace_embeddings)] <- 0.0
+
+process_embeddings_norm <- normalize_trace_embeddings(as.data.table(copy(trace_embeddings)),
+                                                      action_embedding_size = 4)
+
+process_embeddings_norm_cut <- process_embeddings_norm[, .(alert_id, V1, V2, V3, V4, V5, V6, V7, V8)]
+
+# visualization of trace embeddings
+embedding_umap <- umap(process_embeddings_norm_cut, 
+                       n_components = 2, metric = "euclidean", 
+                       n_neighbors = 30, min_dist = 1.5, scale = TRUE)
+df_embedding_umap <- as.data.frame(embedding_umap, stringsAsFactors = FALSE)
+df_embedding_umap <- cbind(df_embedding_umap, attack_prob = process_variants[, attack_prob])
+
+colnames(df_embedding_umap) <- c("UMAP1", "UMAP2", "attack_prob")
+
+tmp_order <- process_variants[, order(attack_prob)]
+fig2 <- ggplot(df_embedding_umap[tmp_order, ], aes(x = UMAP1, y = UMAP2, 
+                                                   colour = attack_prob, 
+                                                   #shape = factor(variant_dt[, cluster_id]),
+                                                   size = process_variants[tmp_order, log(support)])) +
+  geom_point() + 
+  scale_color_gradient2(midpoint=.5, low="blue", mid="white",
+                        high="red", space ="Lab" ) +
+  labs(x = "latent dim 1", y = "latent dim 2", colour = "attack prob", size = "log(#traces)",
+       title = "UMAP visualization of trace variants")
+fig2
+```
+
+
+\  
+\  
+
